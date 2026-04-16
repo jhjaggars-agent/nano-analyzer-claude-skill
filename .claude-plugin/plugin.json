@@ -1,0 +1,10 @@
+{
+  "name": "nano-analyze",
+  "description": "LLM-powered zero-day vulnerability scanner. Scans source files through a three-stage pipeline: context generation, vulnerability scan, and skeptical multi-round triage with codebase grep.",
+  "version": "0.1.0",
+  "author": {
+    "name": "weareaisle"
+  },
+  "keywords": ["security", "vulnerability", "scanner", "zero-day", "llm", "triage"],
+  "skills": "./skills/"
+}

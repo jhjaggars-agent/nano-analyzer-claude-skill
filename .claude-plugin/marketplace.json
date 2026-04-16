@@ -1,0 +1,14 @@
+{
+  "name": "nano-analyze",
+  "owner": {
+    "name": "weareaisle"
+  },
+  "plugins": [
+    {
+      "name": "nano-analyze",
+      "source": "./",
+      "description": "LLM-powered zero-day vulnerability scanner — scans source code with a three-stage pipeline: context generation, vulnerability scan, and skeptical triage",
+      "version": "0.1.0"
+    }
+  ]
+}
