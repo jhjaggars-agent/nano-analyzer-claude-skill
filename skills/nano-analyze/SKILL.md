@@ -1,148 +1,190 @@
 ---
 name: nano-analyze
 description: "Run nano-analyzer, a minimal LLM-powered zero-day vulnerability scanner, against a file or directory of source code. Triggers on: /nano-analyze, \"scan for vulnerabilities\", \"run nano-analyzer\", \"security scan\", \"find zero-day bugs\", \"vulnerability scan\", \"scan this code\""
-argument-hint: "path:<file-or-dir> [model:<model>] [parallel:<n>] [triage-threshold:<level>] [triage-rounds:<n>] [min-confidence:<float>] [project:<name>] [repo-dir:<path>] [verbose-triage]"
+argument-hint: "path:<file-or-dir> [triage-threshold:<level>] [project:<name>] [repo-dir:<path>]"
+allowed-tools: Read, Grep, Glob
 ---
 
 # nano-analyze
 
-You run **nano-analyzer**, a minimal LLM-powered zero-day vulnerability scanner, against a file or directory of source code.
-
-Nano-analyzer uses a three-stage LLM pipeline:
-1. **Context generation** — a model writes a security briefing about each file (what it does, where untrusted data flows, which buffers exist)
-2. **Vulnerability scan** — the same model, primed with that context, hunts for zero-day bugs function by function
-3. **Skeptical triage** — each finding is challenged over multiple rounds by a reviewer that can grep the codebase to verify or refute defenses; an arbiter makes the final call
-
-Results are saved as Markdown and JSON to `~/nano-analyzer-results/<timestamp>/` for human review.
+You are **nano-analyzer**, a minimal zero-day vulnerability scanner. Execute the three-stage pipeline (context → scan → triage) against the target source code using your Read, Grep, and reasoning capabilities. No external API calls or Python scripts are needed — you are the model.
 
 ---
 
-## Phase 1: Parse Arguments
+## Phase 1: Parse Arguments and Discover Files
 
-**Parse the arguments** provided by the user. Recognized arguments:
+**Parse the arguments** provided by the user:
 
-| Argument | Example | Effect |
-|----------|---------|--------|
+| Argument | Example | Default |
+|----------|---------|---------|
 | `path:<file-or-dir>` | `path:./src` | **(Required)** File or directory to scan |
-| `model:<name>` | `model:gpt-5.4` | LLM for all stages (default: `gpt-5.4-nano`) |
-| `parallel:<n>` | `parallel:30` | Max concurrent scan calls (default: 50) |
-| `triage-threshold:<level>` | `triage-threshold:high` | Triage findings at or above this severity: `critical`, `high`, `medium`, `low` (default: `medium`) |
-| `triage-rounds:<n>` | `triage-rounds:3` | Triage rounds per finding (default: 5) |
-| `min-confidence:<float>` | `min-confidence:0.7` | Only surface findings above this confidence 0.0–1.0 (default: 0.0, show all) |
-| `project:<name>` | `project:openssl` | Project name used in triage prompts (default: directory name) |
-| `repo-dir:<path>` | `repo-dir:./` | Repo root for grep lookups during triage |
-| `verbose-triage` | `verbose-triage` | Show per-round triage progress |
+| `triage-threshold:<level>` | `triage-threshold:high` | `medium` — triage findings at or above this severity |
+| `project:<name>` | `project:openssl` | Directory name |
+| `repo-dir:<path>` | `repo-dir:./` | Repo root for grep lookups (default: scan target or its parent) |
 
-**If no `path:` argument is provided**, ask the user what to scan using AskUserQuestion with up to 4 options:
-- **Current directory** — scan all supported source files in `.`
-- **Specific file** — ask for a file path
-- **Specific directory** — ask for a directory path
-- **Cancel** — exit without scanning
+**If no `path:` argument is provided**, ask the user what to scan.
 
-**API key requirements — check before running:**
-- For OpenAI models (name has no `/`, e.g. `gpt-5.4-nano`): `OPENAI_API_KEY` must be set
-- For OpenRouter models (name has `/`, e.g. `qwen/qwen3-32b`): `OPENROUTER_API_KEY` must be set
+**Discover source files** in the target path using Glob. Supported extensions:
+`.c` `.h` `.cc` `.cpp` `.cxx` `.hpp` `.hxx` `.java` `.py` `.go` `.rs` `.js` `.ts` `.rb` `.swift` `.cs` `.php`
 
-If the required key is missing, tell the user:
-```
-Set export OPENAI_API_KEY=sk-...    # for OpenAI models
-# or
-Set export OPENROUTER_API_KEY=sk-or-...  # for OpenRouter models
-```
+Skip symlinks and files larger than ~200KB.
 
 ---
 
-## Phase 2: Run the Scanner
+## Phase 2: Three-Stage Pipeline Per File
 
-Build the command from parsed arguments and run it:
+For each discovered file, run stages 1–3 in order.
 
-```bash
-python3 <SKILL_BASE_DIR>/scripts/scan.py <PATH> \
-  [--model <MODEL>] \
-  [--parallel <N>] \
-  [--triage-threshold <LEVEL>] \
-  [--triage-rounds <N>] \
-  [--min-confidence <FLOAT>] \
-  [--project <NAME>] \
-  [--repo-dir <PATH>] \
-  [--verbose-triage]
+---
+
+### Stage 1: Context Generation
+
+Read the file. Then write a concise security briefing covering:
+
+1. **Purpose** — What this code does and where it sits in the project
+2. **Threat surface** — How untrusted input reaches this code (network, file, API, IPC?)
+3. **Tainted variables** — Name every variable/field that carries attacker-controlled data. Trace the data flow from the entry point to each usage site.
+4. **Fixed-size buffers** — Name every fixed-size buffer and size constant with its numeric size. If a size is defined by a named constant or macro, use Grep to find the actual numeric value. State it explicitly, e.g. `buf[EVP_MAX_MD_SIZE] where EVP_MAX_MD_SIZE=64`.
+5. **Dangerous data flows** — Attacker-controlled data flowing into fixed-size buffers. For each: name the source variable, destination buffer, the function involved, and the buffer's numeric size.
+6. **NULL dereference risk** — Parameters that could be NULL from malformed input but are dereferenced without checks.
+7. **Type confusion** — Tagged unions or variant types accessed without checking the type discriminator first.
+8. **API surface** — Which functions are public API vs static helpers. Note whether static helpers are called only from trusted sites.
+9. **Likely bug classes** — What vulnerability classes are most likely given this code's structure.
+
+Use Grep to look up constant definitions, find callers of functions, and trace data flows across files when the briefing calls for it.
+
+---
+
+### Stage 2: Vulnerability Scan
+
+Using the context briefing, analyze the file **function by function**. For each function, ask:
+
+1. Can any parameter be NULL, too large, negative, or otherwise invalid when called with malformed input?
+2. Are there copies into fixed-size buffers without size validation?
+3. Can integer arithmetic overflow, wrap, or produce negative values used as sizes or indices?
+4. Are tagged unions / variant types accessed without verifying the type discriminator first?
+5. Are return values from fallible operations checked before use?
+
+**Focus** on bugs an external attacker can trigger through untrusted input. Deprioritize:
+- Static helpers with safe, trusted call sites
+- Allocation wrappers with no sizing logic
+- Platform-specific dead code
+- Theoretical issues with no reachable trigger path
+
+**Few-shot example of what to look for:**
+
+```
+parse_packet(pkt, data, len):
+  data and len come from the network. memcpy copies len bytes into a 64-byte
+  stack buffer (header[64]) with no bounds check → overflow if len > 64.
+  → CRITICAL: Stack buffer overflow via unchecked len
+
+handle_request(req):
+  lookup_session() can return NULL for unknown session IDs but the return
+  value is dereferenced unconditionally at sess->handler(req).
+  → HIGH: NULL dereference on failed session lookup
+
+log_debug(msg):
+  Checks msg != NULL before printf. Static helper, only trusted callers.
+  → CLEAN
+
+process_attr(av):
+  Accesses av->value.str_val without first checking av->type tag. If av
+  comes from parsed input, wrong union member is read.
+  → HIGH: Type confusion on union access without type-tag check
 ```
 
-Where `<SKILL_BASE_DIR>` is the directory containing this SKILL.md file.
+**Output each finding in this format:**
 
-**Only include flags for arguments the user explicitly provided.** Omit flags for defaults — the scanner has sensible defaults built in.
-
-**Example invocations:**
-
-```bash
-# Minimal — scan a directory with all defaults
-python3 <SKILL_BASE_DIR>/scripts/scan.py ./src/
-
-# Scan a single file
-python3 <SKILL_BASE_DIR>/scripts/scan.py ./lib/parser.c --model gpt-5.4
-
-# High-confidence findings only, with triage grep over the full repo
-python3 <SKILL_BASE_DIR>/scripts/scan.py ./lib/ --repo-dir ./ --min-confidence 0.7
-
-# Fast scan: fewer rounds, higher threshold, lower parallelism
-python3 <SKILL_BASE_DIR>/scripts/scan.py ./src/ \
-  --triage-threshold high \
-  --triage-rounds 2 \
-  --parallel 20
+```
+[SEVERITY] <title>
+Function: <function_name>()
+Description: <what the bug is and why it is dangerous>
 ```
 
-**While the scanner runs**, narrate progress to the user — the scanner emits live output showing files scanned, severity indicators (🔴🟠🟡🔵⬜), and triage verdicts as they complete.
+Severity levels: `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `INFORMATIONAL`
+
+If the file appears clean, output: `CLEAN — no significant findings.`
+
+---
+
+### Stage 3: Skeptical Triage
+
+For each finding at or above the triage threshold (default: `medium`), challenge it skeptically. **Most scanner findings are false positives.**
+
+**Verdict rules:**
+
+- **VALID** — The bug pattern is real in the code AND an external attacker can trigger it to cause meaningful harm (crash, code execution, data corruption, auth bypass). The attacker must control the input that reaches the bug site.
+- **INVALID** — The bug pattern does not actually exist in the code, OR it is not attacker-reachable (only trusted internal callers reach it), OR a concrete, verified defense prevents it, OR it is a code quality issue rather than a security vulnerability (e.g. diagnostic-state data race, missing NULL check on an internal-only API, undefined behavior only in debug builds).
+- **UNCERTAIN** — Use only when you genuinely cannot determine the verdict after thorough analysis.
+
+**For each finding, work through these steps:**
+
+1. Confirm the bug pattern exists exactly as described in the code.
+2. Trace the data flow **backward** from the bug site to its origin — does attacker-controlled data actually reach it?
+3. Search for defenses: bounds checks, NULL guards, type validations, caller contracts, or sanitization upstream. Use Grep to find them.
+4. If a defense is found, **verify it works**: look up numeric values, do the arithmetic, show your work. "There exists a bound" is NOT the same as "the bound is sufficient."
+
+**ABSENCE OF DEFENSE**: If the bug pattern clearly exists, the input comes from an untrusted source, and you searched for a defense but could not find one, lean toward **VALID** rather than UNCERTAIN. Not having verified every upstream caller is not a reason for UNCERTAIN — only cite a defense if you can name the specific function and show it is sufficient.
+
+**FOLLOW CONSTANTS**: When you encounter a named constant, Grep for its `#define` to find the actual numeric value before drawing conclusions.
+
+**CONSISTENCY**: If your analysis leads to a conclusion, do not contradict it in the same response. If you verify a defense and find it insufficient, that is your answer. Vague references to "assumptions in this codebase" or "other code probably handles this" are not valid defenses.
+
+**Output the triage verdict for each finding:**
+
+```
+VERDICT: VALID / INVALID / UNCERTAIN
+Crux: <the single key fact the verdict depends on>
+Reasoning: <concise explanation — cite specific functions, line logic, or grep results>
+```
 
 ---
 
 ## Phase 3: Present Results
 
-After the scan completes, present a structured summary:
+After all files are scanned, output a structured summary.
 
-### Summary
-- Files scanned, wall time
-- Severity breakdown: 🔴 critical, 🟠 high, 🟡 medium, 🟢 clean
-- Output directory path
-
-### Findings that survived triage (VALID verdict)
-List in descending confidence order:
+### Summary table
 
 ```
-🔥 95% [VVVVV] src/parser.c: Stack buffer overflow via unchecked len
-   📄 ~/nano-analyzer-results/<timestamp>/findings/VULN-001_parser.c.md
+## Scan Summary
 
-✅ 70% [VVIVV] src/auth.c: NULL deref on failed session lookup
-   📄 ~/nano-analyzer-results/<timestamp>/findings/VULN-002_auth.c.md
+| File | Critical | High | Medium | Low | Result |
+|------|----------|------|--------|-----|--------|
+| src/parser.c |  1 |  2 | 0 | 1 | 🔴 |
+| src/auth.c   |  0 |  1 | 1 | 0 | 🟠 |
+| src/utils.c  |  0 |  0 | 0 | 0 | 🟢 |
 ```
 
-Confidence bar: 🔥 = 90%+, ✅ = 70–89%, 🤔 = 50–69%, ❓ = below 50%.
+Severity icons: 🔴 critical findings, 🟠 high, 🟡 medium, 🔵 low, 🟢 clean
 
-Confidence is computed as `(VALID rounds) / (total rounds)` including the arbiter round.
+### Validated findings (survived triage as VALID)
 
-### Next steps
-After the summary, offer:
-- Explain or drill into a specific finding file
-- Re-scan with adjusted parameters (more rounds for confidence, lower threshold for coverage)
-- Scan a different path
+```
+🔴 [CRITICAL] src/parser.c — Stack buffer overflow via unchecked len
+   Function: parse_packet()
+   memcpy copies attacker-controlled len into header[64] with no bounds check.
+   Triage: VALID — input comes from network recv(), no upstream size gate found.
+
+🟠 [HIGH] src/auth.c — NULL dereference on failed session lookup
+   Function: handle_request()
+   lookup_session() returns NULL for unknown IDs; result dereferenced unconditionally.
+   Triage: VALID — attacker sends unknown session_id, no NULL check before deref.
+```
+
+### Limitations
+
+- **C/C++ bias** — Prompts and heuristics are tuned for C/C++ memory safety bugs. Other languages are scanned but with lower effectiveness.
+- **Single-file analysis** — Each file is analyzed independently. Cross-file vulnerabilities that depend on interactions between compilation units may be missed.
+- **False positives** — Always verify findings manually before reporting. The triage stage reduces but does not eliminate false positives.
+- **False negatives** — A clean scan does not mean the code is safe. Logic bugs, race conditions, cryptographic issues, and authentication bypasses are difficult to detect without full context.
 
 ---
 
-## Error Handling
+## Guidance
 
-| Error | Response |
-|-------|----------|
-| API key not set | Tell user to set `OPENAI_API_KEY` or `OPENROUTER_API_KEY` as appropriate |
-| Path not found | Confirm path relative to cwd; suggest `ls` to verify |
-| No scannable files | Report the path; note supported extensions: `.c .h .cc .cpp .cxx .hpp .hxx .java .py .go .rs .js .ts .rb .swift .m .mm .cs .php .pl .sh` |
-| Rate limit errors | Suggest reducing `--parallel`; scanner retries automatically |
-| Scanner error | Show stderr output; suggest checking API key and network access |
-
----
-
-## Notes
-
-- **C/C++ bias.** Prompts, few-shot examples, and heuristics are tuned for C/C++ memory safety bugs. Other languages are scanned but with lower effectiveness.
-- **Multi-round triage** (default: 5 rounds + arbiter) significantly reduces false positives. Reduce for speed, increase for confidence.
-- **Use `--repo-dir`** when scanning a subdirectory so triage grep can search the full codebase to verify defenses.
-- **OpenRouter support.** Any model accessible via OpenRouter can be used by setting `OPENROUTER_API_KEY` and using a `provider/model` name (e.g. `qwen/qwen3-32b`).
-- Results persist in `~/nano-analyzer-results/<timestamp>/` after the scan; individual finding files include full triage reasoning chains.
+- **Use Grep liberally** during triage to verify defenses, resolve constant values, and find callers. This is the primary mechanism for grounding verdicts in actual code evidence.
+- For large directories, note the file count before starting and track progress clearly.
+- When UNCERTAIN, note exactly what additional context (e.g. caller information, constant values) would resolve the ambiguity.
+- Prioritize findings where **attackers control the triggering input** — purely internal bugs reachable only through trusted callers are lower priority.
